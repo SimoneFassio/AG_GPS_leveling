@@ -83,7 +83,7 @@ class GPSSimulator:
             self.longitude -= 0.00001
 
         self.heading = (self.heading + 1) % 360
-        self.altitude += random.uniform(-0.1, 0.1)
+        self.altitude = self.latitude * 10
         self.roll = random.uniform(-5, 5)
         self.imu_heading = self.heading
         self.imu_roll = self.roll
