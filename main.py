@@ -6,7 +6,8 @@ from PyQt5.QtCore import Qt, QTimer
 from gps_receiver import GPSReceiver
 from field_model import FieldModel
 from plot_widget import FieldPlotWidget, LevelingPlotWidget, ElevationDiffColorBar
-from leveling import compute_target_grid, compute_best_plane
+from leveling import compute_target_grid, compute_best_plane, compute_best_offset
+import numpy as np
 
 class StartupDialog(QDialog):
     def __init__(self, parent=None):
@@ -46,8 +47,8 @@ class SurveyWidget(QWidget):
     def update_plot(self):
         self.plot_widget.update_points(self.field_model.points)
     
-    def update_tractor(self, x, y):
-        self.plot_widget.update_tractor(x, y)
+    def update_tractor(self, x, y, heading):
+        self.plot_widget.update_tractor(x, y, heading)
 
 class LevelingWidget(QWidget):
     def __init__(self, field_model, parent=None):
@@ -55,21 +56,28 @@ class LevelingWidget(QWidget):
         self.field_model = field_model
         main_layout = QVBoxLayout(self)
         
-        # Input per slope e bottoni
+        # Input for slope and buttons
         input_layout = QHBoxLayout()
         self.slope_x_input = QLineEdit()
-        self.slope_x_input.setPlaceholderText("Slope X (cm/100m)")
+        self.slope_x_input.setPlaceholderText("Pendenza X (cm/100m)")
         self.slope_y_input = QLineEdit()
-        self.slope_y_input.setPlaceholderText("Slope Y (cm/100m)")
-        input_layout.addWidget(QLabel("Slope X desiderato:"))
+        self.slope_y_input.setPlaceholderText("Pendenza Y (cm/100m)")
+        input_layout.addWidget(QLabel("Pendenza X:"))
         input_layout.addWidget(self.slope_x_input)
-        input_layout.addWidget(QLabel("Slope Y desiderato:"))
+        input_layout.addWidget(QLabel("Pendenza Y:"))
         input_layout.addWidget(self.slope_y_input)
         self.compute_btn = QPushButton("Applica Livellamento")
         self.auto_compute_btn = QPushButton("Calcolo Automatico Piana")
+        self.save_grid_btn = QPushButton("Salva Campo")
         input_layout.addWidget(self.compute_btn)
         input_layout.addWidget(self.auto_compute_btn)
+        input_layout.addWidget(self.save_grid_btn)
+        self.diff_label = QLabel("--")
+        self.diff_label.setStyleSheet("font-size: 50px;")
+        input_layout.addWidget(self.diff_label)
         main_layout.addLayout(input_layout)
+        self.elev_info_label = QLabel("Current Elev: --, Target: --")
+        main_layout.addWidget(self.elev_info_label)
         
         # Layout orizzontale per plot e color bar
         plot_layout = QHBoxLayout()
@@ -79,84 +87,80 @@ class LevelingWidget(QWidget):
         plot_layout.addWidget(self.color_bar, stretch=1)
         main_layout.addLayout(plot_layout)
         
-        # Info label per mostrare l'elevazione corrente, target e differenza
-        self.elev_info_label = QLabel("Current Elev: --, Target: --, Diff: --")
-        main_layout.addWidget(self.elev_info_label)
-        
-        self.auto_result_label = QLabel("")
-        main_layout.addWidget(self.auto_result_label)
-        
         # Connessione bottoni
         self.compute_btn.clicked.connect(self.apply_levelling)
         self.auto_compute_btn.clicked.connect(self.auto_compute)
+        self.save_grid_btn.clicked.connect(self.save_grid)
         
-        # Timer per aggiornare la griglia (ogni 2 secondi)
-        self.grid_timer = QTimer(self)
-        self.grid_timer.timeout.connect(self.update_interpolated_grid)
-        self.grid_timer.start(2000)
-        self.interpolation_worker = None  # Worker per interpolazione
     
     def apply_levelling(self):
+        self.field_model.update_points_from_grid()
+        try:
+            slope_x = float(self.slope_x_input.text())
+            slope_y = float(self.slope_y_input.text())
+        except ValueError:
+            slope_x = 0.0
+            slope_y = 0.0
+        
+        self.field_model.plane_b = slope_x / 10000.0
+        self.field_model.plane_c = slope_y / 10000.0
+        self.field_model.plane_a = compute_best_offset(self.field_model.points, self.field_model.plane_b, self.field_model.plane_c)
         self.update_interpolated_grid()
     
     def auto_compute(self):
+        self.field_model.update_points_from_grid()
         if not self.field_model.points:
             QMessageBox.warning(self, "Errore", "Nessun dato di rilevamento disponibile.")
             return
         a, b, c = compute_best_plane(self.field_model.points)
+        self.field_model.plane_a = a
+        self.field_model.plane_b = b
+        self.field_model.plane_c = c
+        
         slope_x = b * 10000.0
         slope_y = c * 10000.0
         self.slope_x_input.setText(f"{slope_x:.2f}")
         self.slope_y_input.setText(f"{slope_y:.2f}")
-        self.auto_result_label.setText(f"Piana calcolata: base={a:.2f}, slope_x={slope_x:.2f} cm/100m, slope_y={slope_y:.2f} cm/100m")
         self.update_interpolated_grid()
     
+    def save_grid(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Salva Griglia come Punti", "", "File JSON (*.json)")
+        if filename:
+            self.field_model.save_grid_as_points(filename)
+            QMessageBox.information(self, "Salvataggio Completato", "Griglia salvata come punti.")
+    
     def update_interpolated_grid(self):
-        # Se ci sono meno di 4 punti, non facciamo l'interpolazione (evitiamo l'errore e visualizziamo solo il punto corrente)
-        if len(self.field_model.points) < 4:
-            self.leveling_plot.img_item.clear()
+        if not self.field_model.leveling_mode:
             return
-        # Evitiamo di avviare più worker contemporaneamente
-        if self.interpolation_worker is not None and self.interpolation_worker.isRunning():
-            return
-        from interpolation_worker import InterpolationWorker
-        self.interpolation_worker = InterpolationWorker(self.field_model.points, resolution=1.0)
-        self.interpolation_worker.result_ready.connect(self.on_interpolation_result)
-        self.interpolation_worker.start()
+            
+        if self.field_model.plane_b is not None:
+            target_grid = compute_target_grid(
+                self.field_model.grid_x, 
+                self.field_model.grid_y, 
+                self.field_model.plane_a, 
+                self.field_model.plane_b, 
+                self.field_model.plane_c
+            )
+            self.leveling_plot.update_grid(
+                self.field_model.grid_x, 
+                self.field_model.grid_y, 
+                self.field_model.grid_z, 
+                target_grid
+            )
+            diff = self.field_model.grid_z - target_grid
+            min_diff = np.nanmin(diff)
+            max_diff = np.nanmax(diff)
+            self.color_bar.setRange(min_diff*100, max_diff*100)
     
-    def on_interpolation_result(self, grid_x, grid_y, survey_grid):
-        if grid_x is None or survey_grid is None:
-            return
-        base_elev = self.field_model.points[0]["alt"] if self.field_model.points else 0
-        try:
-            slope_x = float(self.slope_x_input.text())
-            slope_y = float(self.slope_y_input.text())
-        except ValueError:
-            slope_x = 0.0
-            slope_y = 0.0
-        from leveling import compute_target_grid
-        target_grid = compute_target_grid(grid_x, grid_y, slope_x, slope_y, base_elev)
-        self.leveling_plot.update_grid(grid_x, grid_y, survey_grid, target_grid)
-        import numpy as np
-        diff = target_grid - survey_grid
-        min_diff = np.nanmin(diff)
-        max_diff = np.nanmax(diff)
-        self.color_bar.setRange(min_diff, max_diff)
-    
-    def update_tractor(self, x, y, current_alt=None):
-        self.leveling_plot.update_tractor(x, y)
-        # Calcola l'elevazione target al punto attuale usando il modello
-        try:
-            slope_x = float(self.slope_x_input.text())
-            slope_y = float(self.slope_y_input.text())
-        except ValueError:
-            slope_x = 0.0
-            slope_y = 0.0
-        base_elev = self.field_model.points[0]["alt"] if self.field_model.points else 0
-        target_elev = base_elev + x * (slope_x / 10000.0) + y * (slope_y / 10000.0)
+    def update_tractor(self, x, y, current_alt, heading):
+        self.leveling_plot.update_tractor(x, y, heading)
+        if self.field_model.plane_b is not None:
+            target_elev = compute_target_grid(x, y, self.field_model.plane_a, self.field_model.plane_b, self.field_model.plane_c)
         if current_alt is not None:
-            diff = target_elev - current_alt
-            self.elev_info_label.setText(f"Current Elev: {current_alt:.2f}, Target: {target_elev:.2f}, Diff: {diff:.2f}")
+            diff = current_alt - target_elev
+            self.elev_info_label.setText(f"Current Elev: {current_alt:.2f}, Target: {target_elev:.2f}")
+            self.diff_label.setText(f"{diff*100:.0f} cm")
+            self.color_bar.setLineValue(diff*100)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -181,33 +185,66 @@ class MainWindow(QMainWindow):
         self.gps_receiver.start()
         
         # Dock per lo status
-        self.status_dock = QDockWidget("Status", self)
         self.status_widget = QWidget()
-        status_layout = QVBoxLayout(self.status_widget)
+        status_layout = QHBoxLayout(self.status_widget)
         self.gps_status_label = QLabel("GPS: Non in ricezione")
-        status_layout.addWidget(self.gps_status_label)
         self.elevation_status_label = QLabel("Elevation: --")
+        status_layout.addWidget(self.gps_status_label)
         status_layout.addWidget(self.elevation_status_label)
-        self.status_dock.setWidget(self.status_widget)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.status_dock)
+        self.status_widget.setLayout(status_layout)
+        self.status_bar = self.statusBar()
+        self.status_bar.addPermanentWidget(self.status_widget)
     
     def handle_gps_data(self, gps_data):
-        self.field_model.add_point(gps_data)
         x, y = self.field_model.latlon_to_xy(gps_data["latitude"], gps_data["longitude"])
-        if self.stacked_widget.currentIndex() == 0:
+        
+        if self.stacked_widget.currentIndex() == 0:  # survey phase
+            self.field_model.add_point(gps_data)
             self.survey_widget.update_plot()
-            self.survey_widget.update_tractor(x, y)
-        elif self.stacked_widget.currentIndex() == 1:
-            self.leveling_widget.update_tractor(x, y, current_alt=gps_data["altitude"])
+            self.survey_widget.update_tractor(x, y, heading=gps_data["headingTrueDual"])
+        elif self.stacked_widget.currentIndex() == 1:  # leveling phase
+            current_alt = gps_data["altitude"] - self.field_model.ref_alt
+            # Update grid points in front of the tractor
+            self.field_model.update_grid_elevation(
+                gps_data["latitude"], 
+                gps_data["longitude"], 
+                current_alt, 
+                radius=4.5,
+                direction_deg=gps_data["headingTrueDual"]
+            )
+            self.leveling_widget.update_tractor(x, y, current_alt, gps_data["headingTrueDual"])
             self.leveling_widget.update_interpolated_grid()
+        
         self.gps_status_label.setText("GPS: In ricezione")
-        self.elevation_status_label.setText(f"Elevation: {gps_data['altitude']:.2f}")
-    
+        self.elevation_status_label.setText(f"Elevation: {gps_data['altitude']:.2f}")  
+          
     def end_survey(self):
         filename, _ = QFileDialog.getSaveFileName(self, "Salva Dati Campo", "", "File JSON (*.json)")
         if filename:
             self.field_model.save_to_file(filename)
+        
+        self.generate_grid()
+        
+        # Switch to leveling mode
         self.stacked_widget.setCurrentIndex(1)
+        self.leveling_widget.update_interpolated_grid()
+        
+    def generate_grid(self):
+        # Generate the leveling grid before switching to leveling mode
+        if len(self.field_model.points) < 4:
+            QMessageBox.warning(self, "Errore", "Sono necessari almeno 4 punti per generare la griglia di livellamento.")
+            return
+            
+        # Generate grid with 1m resolution
+        if not self.field_model.generate_leveling_grid(resolution=1.0):
+            QMessageBox.warning(self, "Errore", "Impossibile generare la griglia di livellamento.")
+            return
+        
+        print(f"Grid generated with shape: {self.field_model.grid_z.shape}")
+        
+        self.field_model.plane_a = compute_best_offset(self.field_model.points, self.field_model.plane_b, self.field_model.plane_c)
+        self.leveling_widget.update_interpolated_grid()
+        
     
     def closeEvent(self, event):
         self.gps_receiver.stop()
@@ -223,6 +260,7 @@ def main():
             if filename:
                 main_win.field_model.load_from_file(filename)
                 main_win.stacked_widget.setCurrentIndex(1)
+                main_win.generate_grid()
         main_win.show()
         sys.exit(app.exec_())
 
