@@ -107,7 +107,7 @@ class ElevationDiffColorBar(QWidget):
         self.color_bar_diff = np.max([np.abs(self.min_diff), np.abs(self.max_diff)])
         self.line_value = 0
         self.setMinimumWidth(50)
-        self.setMaximumWidth(50)
+        self.setMaximumWidth(120)
     
     def setRange(self, min_diff, max_diff):
         self.min_diff = min_diff
