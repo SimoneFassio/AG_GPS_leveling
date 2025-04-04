@@ -6,17 +6,20 @@ from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPen
 from PyQt5.QtCore import Qt
 from pyqtgraph.Qt import QtCore
 
-class FieldPlotWidget(QWidget):
+class FieldPlotWidget(pg.GraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        self.plot_widget = pg.PlotWidget(title="Field Survey")
-        layout.addWidget(self.plot_widget)
+        self.plot_item = pg.PlotItem()
+        self.setCentralItem(self.plot_item)
+        
+        # Lock aspect ratio to 1:1
+        self.plot_item.setAspectLocked(True, ratio=1)
+        
         self.scatter = pg.ScatterPlotItem()
-        self.plot_widget.addItem(self.scatter)
+        self.plot_item.addItem(self.scatter)
         # Tractor marker as an arrow (rotatable)
         self.tractor_marker = pg.ArrowItem(angle=0, tipAngle=45, baseAngle=25, headLen=40, tailLen=0, tailWidth=0, brush='g')
-        self.plot_widget.addItem(self.tractor_marker)
+        self.plot_item.addItem(self.tractor_marker)
     
     def update_points(self, points):
         if not points:
@@ -41,24 +44,30 @@ class FieldPlotWidget(QWidget):
         
         spots = [{'pos': (x, y), 'data': 1, 'brush': color} for x, y, color in zip(xs, ys, colors)]
         self.scatter.setData(spots)
+        
+        # Make sure to re-apply the aspect lock after updates, if needed
+        self.plot_item.setAspectLocked(True, ratio=1)
     
     def update_tractor(self, x, y, heading=0):
         # Update position and orientation of the arrow marker.
         self.tractor_marker.setPos(x, y)
         self.tractor_marker.setRotation(heading+90)
 
-class LevelingPlotWidget(QWidget):
+class LevelingPlotWidget(pg.GraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        self.plot_widget = pg.PlotWidget(title="Levelling Phase")
-        layout.addWidget(self.plot_widget)
+        self.plot_item = pg.PlotItem()
+        self.setCentralItem(self.plot_item)
+        
+        # Lock aspect ratio to 1:1
+        self.plot_item.setAspectLocked(True, ratio=1)
+        
         self.img_item = pg.ImageItem()
-        self.plot_widget.addItem(self.img_item)
+        self.plot_item.addItem(self.img_item)
         # Replace tractor marker with an ArrowItem for proper rotation.
         self.tractor_marker = pg.ArrowItem(angle=0, tipAngle=45, baseAngle=25, headLen=40, tailLen=0, tailWidth=0, brush='g')
-        self.plot_widget.addItem(self.tractor_marker)
-        self.plot_widget.setAspectLocked(True)
+        self.plot_item.addItem(self.tractor_marker)
+        self.plot_item.setAspectLocked(True)
         lut = np.empty((256, 4), dtype=np.uint8)
         for i in range(256):
             ratio = i / 255.0
@@ -94,6 +103,8 @@ class LevelingPlotWidget(QWidget):
         y1 = grid_y[-1, -1]
         rect = QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
         self.img_item.setRect(rect)
+        
+        self.plot_item.setAspectLocked(True, ratio=1)
     
     def update_tractor(self, x, y, heading=0):
         self.tractor_marker.setPos(x, y)
@@ -128,7 +139,9 @@ class ElevationDiffColorBar(QWidget):
         painter.fillRect(rect, gradient)
         painter.setPen(Qt.black)
         font = QFont()
-        font.setPointSize(20)
+        # Use relative size based on widget height
+        font_size = max(10, int(rect.height() / 15))
+        font.setPointSize(font_size)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignBottom | Qt.AlignHCenter, f"{(-self.color_bar_diff):.2f}")
         painter.drawText(rect, Qt.AlignTop | Qt.AlignHCenter, f"{self.color_bar_diff:.2f}")

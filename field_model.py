@@ -21,6 +21,7 @@ class FieldModel:
         self.grid_y = None
         self.grid_z = None
         self.grid_resolution = 1.0  # Default grid resolution in meters
+        self.rotation_angle = 0.0  # new field for storing rotation in radians
 
 
     def add_point(self, gps_data):
@@ -88,17 +89,30 @@ class FieldModel:
     
     
     def generate_leveling_grid(self, resolution=1.0):
-        """Generate a fixed grid for leveling phase using interpolation"""
-        self.grid_resolution = resolution
-        
-        # Get bounds with some padding
+        """
+        Generate a fixed grid for leveling phase using interpolation.
+        Steps:
+         1) Set ref_alt to the minimum altitude among all points
+         2) Recompute each point's Z relative to new ref_alt
+         3) Proceed with grid generation
+        """
         points = self.points
         if not points:
             return False
-            
+
+        # 1) Find min altitude among all points
+        min_alt_in_points = min(p["alt"] for p in points)
+
+        # 2) Update ref_alt to that minimum altitude, then recalc local Z
+        self.ref_alt = min_alt_in_points
+        for p in points:
+            p["z"] = p["alt"] - self.ref_alt
+        
+        # 3) Create grid and interpolate
+        self.grid_resolution = resolution
         xs = [p["x"] for p in points]
         ys = [p["y"] for p in points]
-        
+
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         
@@ -107,25 +121,20 @@ class FieldModel:
         max_x += padding
         min_y -= padding
         max_y += padding
-    
-        # Create grid
+
         x_range = np.arange(min_x, max_x + resolution, resolution)
         y_range = np.arange(min_y, max_y + resolution, resolution)
         self.grid_x, self.grid_y = np.meshgrid(x_range, y_range)
         
-        # Get survey points
+        # Interpolate Z
         points_xy = np.array([(p["x"], p["y"]) for p in points])
         points_z = np.array([p["z"] for p in points])
-        
-        # Perform interpolation
         self.grid_z = griddata(points_xy, points_z, (self.grid_x, self.grid_y), method='linear')
         
-        # Set leveling mode flag
         self.leveling_mode = True
-        
         return True
     
-    def update_grid_elevation(self, current_lat, current_lon, current_elev, radius, direction_deg):
+    def update_grid_elevation(self, x0, y0, current_elev, radius, direction_deg):
         """Update grid points along a line that is perpendicular to the given heading,
         centered at (x0, y0). 'radius' defines the total length of the line.
         Only grid cells within a bounding box (derived from the line parameters)
@@ -133,9 +142,6 @@ class FieldModel:
         """
         if not self.leveling_mode or self.grid_z is None:
             return
-
-        # Convert current position to XY
-        x0, y0 = self.latlon_to_xy(current_lat, current_lon)
 
         # Convert navigation heading to a unit vector.
         # Navigation: 0° is North, 90° is East.
@@ -269,8 +275,116 @@ class FieldModel:
 
     def update_points_from_grid(self):
         """Update points with the current grid values"""
-        if not self.leveling_mode:
-            return
+        # if not self.leveling_mode:
+        #     return
         
         points = self.get_grid_as_points()
         self.points = points
+
+    def rotate_field(self, angle_radians):
+        """Rotate all points in-place by angle_radians around origin."""
+        cos_a = math.cos(angle_radians)
+        sin_a = math.sin(angle_radians)
+        for p in self.points:
+            x_old, y_old = p["x"], p["y"]
+            x_new = x_old * cos_a - y_old * sin_a
+            y_new = x_old * sin_a + y_old * cos_a
+            p["x"] = x_new
+            p["y"] = y_new
+
+    def import_from_elevation_txt_to_grid(self, filename, resolution=1.0):
+        """Import data from Elevation.txt directly to a grid structure for efficiency"""
+        # First, parse the Elevation.txt file into temporary points
+        temp_points = []
+        header_found = False
+        ref_lat = None
+        ref_lon = None
+        
+        with open(filename, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines
+                if not line:
+                    continue
+                
+                # Look for the header line with column names
+                if not header_found and "Latitude,Longitude,Elevation" in line:
+                    header_found = True
+                    continue
+                
+                # Extract StartFix for reference if we find it 
+                if not header_found and line.startswith("StartFix"):
+                    parts = line.strip().split(",")
+                    if len(parts) >= 2:
+                        try:
+                            ref_lat = float(parts[0])
+                            ref_lon = float(parts[1]) 
+                        except ValueError:
+                            pass
+                    continue
+                
+                # Once header is found, process data lines
+                if header_found and line[0].isdigit():
+                    parts = line.split(",")
+                    if len(parts) < 3:
+                        continue
+                    
+                    try:
+                        lat = float(parts[0])
+                        lon = float(parts[1])
+                        elev = float(parts[2])
+                        
+                        # Set reference point to first point if not defined
+                        if ref_lat is None or ref_lon is None:
+                            ref_lat = lat
+                            ref_lon = lon
+                        
+                        temp_points.append({"lat": lat, "lon": lon, "alt": elev})
+                    except ValueError:
+                        continue
+        
+        if not temp_points:
+            return False
+        
+        # Set reference coordinates from the first valid point
+        self.ref_lat = ref_lat if ref_lat is not None else temp_points[0]["lat"]
+        self.ref_lon = ref_lon if ref_lon is not None else temp_points[0]["lon"]
+        
+        # Find minimum altitude to use as reference
+        min_alt = min(p["alt"] for p in temp_points)
+        self.ref_alt = min_alt
+        
+        # Convert the points to local XY coordinates
+        for p in temp_points:
+            x, y = self.latlon_to_xy(p["lat"], p["lon"])
+            p["x"] = x
+            p["y"] = y
+            p["z"] = p["alt"] - self.ref_alt
+        
+        # Now directly generate a grid from these points
+        xs = [p["x"] for p in temp_points]
+        ys = [p["y"] for p in temp_points]
+
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        padding = 5.0  # 5m padding
+        min_x -= padding
+        max_x += padding
+        min_y -= padding
+        max_y += padding
+
+        x_range = np.arange(min_x, max_x + resolution, resolution)
+        y_range = np.arange(min_y, max_y + resolution, resolution)
+        self.grid_x, self.grid_y = np.meshgrid(x_range, y_range)
+        
+        # Interpolate Z
+        points_xy = np.array([(p["x"], p["y"]) for p in temp_points])
+        points_z = np.array([p["z"] for p in temp_points])
+        self.grid_z = griddata(points_xy, points_z, (self.grid_x, self.grid_y), method='linear')
+        
+        self.leveling_mode = True
+        self.rotation_angle = 0.0  # Initialize rotation angle
+        
+        # Success
+        return True

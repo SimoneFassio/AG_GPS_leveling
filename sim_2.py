@@ -9,8 +9,8 @@ class KeyboardGPSSimulator:
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.destination = ("127.0.0.1", 15555)
-        self.latitude = 45.0  # Starting latitude
-        self.longitude = 9.0  # Starting longitude
+        self.latitude = 45.26935235  # Starting latitude
+        self.longitude = 8.0055765  # Starting longitude
         self.altitude = 100.0  # Starting altitude
         self.speed = 5.0  # Speed in km/h
         self.heading = 0.0  # Heading in degrees
