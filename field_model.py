@@ -22,6 +22,8 @@ class FieldModel:
         self.grid_z = None
         self.grid_resolution = 1.0  # Default grid resolution in meters
         self.rotation_angle = 0.0  # new field for storing rotation in radians
+        self.vertical_offset = 0.0 # Vertical offset for leveling
+        self.vertical_offset_old = 0.0 # Old vertical offset for leveling
 
 
     def add_point(self, gps_data):
@@ -61,25 +63,36 @@ class FieldModel:
         return x, y
 
     def save_to_file(self, filename):
-        """Save all points to JSON file"""
+        """Save all points and field properties to JSON file"""
         data = {
             "ref_lat": self.ref_lat,
             "ref_lon": self.ref_lon,
             "ref_alt": self.ref_alt,
+            "rotation_angle": self.rotation_angle,  # Save the rotation angle
             "points": self.points
         }
         with open(filename, "w") as f:
             json.dump(data, f, default=float)
 
     def load_from_file(self, filename):
-        """Load points from JSON file"""
+        """Load points and field properties from JSON file"""
         with open(filename, "r") as f:
             data = json.load(f)
             
         self.points = data["points"]
         self.ref_lat = data["ref_lat"]
         self.ref_lon = data["ref_lon"]
-        self.ref_alt = data["ref_alt"] 
+        self.ref_alt = data["ref_alt"]
+        
+        # Load the rotation angle if it exists, default to 0.0
+        self.rotation_angle = data.get("rotation_angle", 0.0)
+        
+        # If the field had a non-zero rotation, apply it to points immediately
+        if abs(self.rotation_angle) > 1e-9:
+            print(f"Applying saved rotation angle of {math.degrees(self.rotation_angle):.2f}°")
+            # Points are already rotated in the file, no need to rotate again
+        
+        return True
 
     def get_bounds(self):
         """Get bounding box of all points"""
@@ -90,47 +103,112 @@ class FieldModel:
     
     def generate_leveling_grid(self, resolution=1.0):
         """
-        Generate a fixed grid for leveling phase using interpolation.
-        Steps:
-         1) Set ref_alt to the minimum altitude among all points
-         2) Recompute each point's Z relative to new ref_alt
-         3) Proceed with grid generation
+        Generate a grid for leveling that follows the concave shape of the field points.
+        Ignores large holes in the interior (>5m across) where no survey data was collected.
         """
+        from scipy.spatial import Delaunay, ConvexHull
+        from shapely.geometry import Polygon, Point
+        from shapely.ops import unary_union
+        
         points = self.points
         if not points:
             return False
 
-        # 1) Find min altitude among all points
+        # 1) Find min altitude among all points and update reference
         min_alt_in_points = min(p["alt"] for p in points)
-
-        # 2) Update ref_alt to that minimum altitude, then recalc local Z
         self.ref_alt = min_alt_in_points
         for p in points:
             p["z"] = p["alt"] - self.ref_alt
-        
-        # 3) Create grid and interpolate
+
+        # 2) Extract x,y coordinates
         self.grid_resolution = resolution
-        xs = [p["x"] for p in points]
-        ys = [p["y"] for p in points]
+        xs = np.array([p["x"] for p in points])
+        ys = np.array([p["y"] for p in points])
+        points_xy = np.column_stack((xs, ys))
 
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        
-        padding = 5.0  # 5m padding
-        min_x -= padding
-        max_x += padding
-        min_y -= padding
-        max_y += padding
+        # Quick fallback if too few points
+        if len(points_xy) < 3:
+            return False
 
+        # 3) Build concave hull via Delaunay -> alpha-like filtering. Fallback to convex hull on error.
+        try:
+            tri = Delaunay(points_xy)
+            triangles = points_xy[tri.simplices]
+            # Compute max edge length of each triangle
+            edge_lengths = []
+            for t in triangles:
+                e1 = np.linalg.norm(t[1] - t[0])
+                e2 = np.linalg.norm(t[2] - t[1])
+                e3 = np.linalg.norm(t[0] - t[2])
+                edge_lengths.append(max(e1, e2, e3))
+            # Filter out "large" triangles
+            alpha = np.percentile(edge_lengths, 90)
+            valid_triangles = [Polygon(t) for t, ln in zip(triangles, edge_lengths) if ln < alpha]
+
+            if not valid_triangles:
+                hull = ConvexHull(points_xy)
+                field_boundary = Polygon(points_xy[hull.vertices])
+            else:
+                polygons = unary_union(valid_triangles)
+                # If union is multi-polygon, keep the largest
+                if polygons.geom_type == 'MultiPolygon':
+                    field_boundary = max(polygons.geoms, key=lambda p: p.area)
+                else:
+                    field_boundary = polygons
+        except:
+            hull = ConvexHull(points_xy)
+            field_boundary = Polygon(points_xy[hull.vertices])
+
+        # 4) Remove large holes. Any interior ring with area > ~25 m² (≈ circle of diameter 5 m)
+        cleaned_interior_polygons = []
+        for interior in field_boundary.interiors:
+            hole_poly = Polygon(interior)
+            # If hole is smaller than 25 m², keep it. Otherwise skip it.
+            if hole_poly.area < 25:
+                cleaned_interior_polygons.append(hole_poly)
+
+        # Rebuild polygon without large holes
+        field_boundary = Polygon(field_boundary.exterior.coords, [p.exterior.coords for p in cleaned_interior_polygons])
+
+        # 5) Create a 5 m buffer inside the boundary for partial regions
+        #    (means we do NOT fill grid for regions more than 5 m away from survey boundaries).
+        actual_field = field_boundary.buffer(5.0)
+
+        # If buffering inward removes everything, just skip
+        if actual_field.is_empty:
+            return False
+
+        # 6) Enclose the boundary for final bounding box
+        min_x, min_y, max_x, max_y = actual_field.bounds
         x_range = np.arange(min_x, max_x + resolution, resolution)
         y_range = np.arange(min_y, max_y + resolution, resolution)
         self.grid_x, self.grid_y = np.meshgrid(x_range, y_range)
-        
-        # Interpolate Z
-        points_xy = np.array([(p["x"], p["y"]) for p in points])
+        grid_shape = self.grid_x.shape
+
+        # 7) Initialize grid_z with NaN
+        self.grid_z = np.full(grid_shape, np.nan)
+
+        # 8) Prepare interpolation
         points_z = np.array([p["z"] for p in points])
-        self.grid_z = griddata(points_xy, points_z, (self.grid_x, self.grid_y), method='linear')
-        
+
+        # 9) Assign z-values only inside actual_field polygon
+        inside_points = []
+        inside_indices = []
+        for i in range(grid_shape[0]):
+            for j in range(grid_shape[1]):
+                x = self.grid_x[i, j]
+                y = self.grid_y[i, j]
+                if actual_field.contains(Point(x, y)):
+                    inside_points.append((x, y))
+                    inside_indices.append((i, j))
+
+        # Interpolate wherever inside_points exist
+        if inside_points:
+            inside_points = np.array(inside_points)
+            z_values = griddata(points_xy, points_z, inside_points, method='linear')
+            for k, (i, j) in enumerate(inside_indices):
+                self.grid_z[i, j] = z_values[k]
+
         self.leveling_mode = True
         return True
     
@@ -215,6 +293,27 @@ class FieldModel:
 
         return modified
     
+    def apply_vertical_offset_grid(self, offset):
+        """
+        Apply a vertical offset to all z values in the grid.
+        
+        Args:
+            offset: Vertical offset in meters to apply.
+            
+        Returns:
+            bool: True if applied successfully, False if no grid or not in leveling mode.
+        """
+        if not self.leveling_mode or self.grid_z is None:
+            return False
+            
+        # Add offset to all non-NaN values in the grid
+        valid_mask = ~np.isnan(self.grid_z)
+        if np.any(valid_mask):
+            self.grid_z[valid_mask] += offset
+            return True
+        
+        return False
+    
     def get_grid_as_points(self):
         """Convert current grid to a list of points for saving"""
         if not self.leveling_mode:
@@ -255,6 +354,7 @@ class FieldModel:
             "ref_lat": self.ref_lat,
             "ref_lon": self.ref_lon,
             "ref_alt": self.ref_alt,
+            "rotation_angle": self.rotation_angle,  # Save rotation angle
             "points": points
         }
         with open(filename, "w") as f:

@@ -77,26 +77,37 @@ class LevelingWidget(QWidget):
 
         # Input for slope and buttons
         input_layout = QHBoxLayout()
+        
+        # Add vertical offset input
+        self.vertical_offset_label = QLabel("Offset verticale (cm):")
+        self.vertical_offset_label.setStyleSheet(f"font-size: {MEDIUM_FONT};")
+        self.vertical_offset_input = QLineEdit("0")
+        self.vertical_offset_input.setStyleSheet(f"font-size: {MEDIUM_FONT};")
+        self.vertical_offset_input.setPlaceholderText("Offset (cm)")
+        input_layout.addWidget(self.vertical_offset_label)
+        input_layout.addWidget(self.vertical_offset_input)
+        
+        # Original slope inputs
         self.slope_x_input = QLineEdit()
-        self.slope_x_input.setPlaceholderText("Pendenza orizzontale (cm/100m)")
+        self.slope_x_input.setPlaceholderText("Pendenza oriz. (cm/100m)")
         self.slope_x_input.setStyleSheet(f"font-size: {MEDIUM_FONT};")
         self.slope_y_input = QLineEdit()
-        self.slope_y_input.setPlaceholderText("Pendenza verticale (cm/100m)")
+        self.slope_y_input.setPlaceholderText("Pendenza vert. (cm/100m)")
         self.slope_y_input.setStyleSheet(f"font-size: {MEDIUM_FONT};")
         
-        slope_x_label = QLabel("Pendenza orizzontale:")
+        slope_x_label = QLabel("Pendenza orizz.:")
         slope_x_label.setStyleSheet(f"font-size: {MEDIUM_FONT};")
         input_layout.addWidget(slope_x_label)
         input_layout.addWidget(self.slope_x_input)
         
-        slope_y_label = QLabel("Pendenza verticale:")
+        slope_y_label = QLabel("Pendenza vert.:")
         slope_y_label.setStyleSheet(f"font-size: {MEDIUM_FONT};")
         input_layout.addWidget(slope_y_label)
         input_layout.addWidget(self.slope_y_input)
         
-        self.compute_btn = QPushButton("Applica Livellamento")
+        self.compute_btn = QPushButton("Applica pendenze")
         self.compute_btn.setStyleSheet(f"font-size: {MEDIUM_FONT};")
-        self.auto_compute_btn = QPushButton("Calcolo Automatico Piana")
+        self.auto_compute_btn = QPushButton("Calcolo pendenze")
         self.auto_compute_btn.setStyleSheet(f"font-size: {MEDIUM_FONT};")
         self.save_grid_btn = QPushButton("Salva Campo")
         self.save_grid_btn.setStyleSheet(f"font-size: {MEDIUM_FONT};")
@@ -137,14 +148,23 @@ class LevelingWidget(QWidget):
         
     
     def apply_levelling(self):
-        self.field_model.update_points_from_grid()
         try:
             slope_x = float(self.slope_x_input.text())
             slope_y = float(self.slope_y_input.text())
+            self.field_model.vertical_offset = float(self.vertical_offset_input.text()) / 100.0  # Convert from cm to meters
         except ValueError:
             print("Errore: valori di pendenza non validi.")
             slope_x = 0.0
             slope_y = 0.0
+            self.field_model.vertical_offset = 0.0
+        
+        if self.field_model.vertical_offset != self.field_model.vertical_offset_old:
+            offset = self.field_model.vertical_offset - self.field_model.vertical_offset_old
+            self.field_model.apply_vertical_offset_grid(offset)
+            self.field_model.vertical_offset_old = self.field_model.vertical_offset
+            
+        
+        self.field_model.update_points_from_grid()
         
         self.field_model.plane_b = slope_x / 10000.0
         self.field_model.plane_c = slope_y / 10000.0
@@ -362,6 +382,7 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.status_widget)
         
         self.rotation_in_progress = False
+        self.gps_survey_count = 0
     
     def handle_gps_data(self, gps_data):
         """Handle incoming GPS data and update the field model and plot."""
@@ -382,9 +403,12 @@ class MainWindow(QMainWindow):
             heading = gps_data["imuHeading"]/10 - math.degrees(angle) #TODO actually to do a manual VTG
         
         if self.stacked_widget.currentIndex() == 0:  # survey phase
-            self.field_model.add_point(gps_data)
-            self.survey_widget.update_plot()
-            self.survey_widget.update_tractor(x_rot, y_rot, heading=heading)
+            self.gps_survey_count += 1
+            # Every 10 points, add to the field model
+            if self.gps_survey_count % 10 == 0:
+                self.field_model.add_point(gps_data)
+                self.survey_widget.update_plot()
+                self.survey_widget.update_tractor(x_rot, y_rot, heading=heading)
         elif self.stacked_widget.currentIndex() == 1:  # leveling phase
             current_alt = gps_data["altitude"] - self.field_model.ref_alt
             # Update grid points in front of the tractor
@@ -474,6 +498,11 @@ def main():
             filename, _ = QFileDialog.getOpenFileName(main_win, "Carica Dati Campo", "", "File JSON (*.json)")
             if filename:
                 main_win.field_model.load_from_file(filename)
+                
+                # Apply rotation after loading but before generating the grid
+                if abs(main_win.field_model.rotation_angle) > 1e-9:
+                    main_win.apply_rotation_to_points()
+                    
                 main_win.stacked_widget.setCurrentIndex(1)
                 main_win.generate_grid()
         
