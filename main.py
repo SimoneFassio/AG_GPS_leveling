@@ -87,6 +87,15 @@ class LevelingWidget(QWidget):
         input_layout.addWidget(self.vertical_offset_label)
         input_layout.addWidget(self.vertical_offset_input)
         
+        # Add plane offset input
+        self.plane_offset_label = QLabel("Offset piano (cm):")
+        self.plane_offset_label.setStyleSheet(f"font-size: {MEDIUM_FONT};")
+        self.plane_offset_input = QLineEdit("0")
+        self.plane_offset_input.setStyleSheet(f"font-size: {MEDIUM_FONT};")
+        self.plane_offset_input.setPlaceholderText("Offset piano (cm)")
+        input_layout.addWidget(self.plane_offset_label)
+        input_layout.addWidget(self.plane_offset_input)
+        
         # Original slope inputs
         self.slope_x_input = QLineEdit()
         self.slope_x_input.setPlaceholderText("Pendenza oriz. (cm/100m)")
@@ -152,11 +161,13 @@ class LevelingWidget(QWidget):
             slope_x = float(self.slope_x_input.text())
             slope_y = float(self.slope_y_input.text())
             self.field_model.vertical_offset = float(self.vertical_offset_input.text()) / 100.0  # Convert from cm to meters
+            plane_offset = float(self.plane_offset_input.text()) / 100.0  # Convert from cm to meters
         except ValueError:
             print("Errore: valori di pendenza non validi.")
             slope_x = 0.0
             slope_y = 0.0
             self.field_model.vertical_offset = 0.0
+            plane_offset = 0.0
         
         if self.field_model.vertical_offset != self.field_model.vertical_offset_old:
             offset = self.field_model.vertical_offset - self.field_model.vertical_offset_old
@@ -168,17 +179,31 @@ class LevelingWidget(QWidget):
         
         self.field_model.plane_b = slope_x / 10000.0
         self.field_model.plane_c = slope_y / 10000.0
-        self.field_model.plane_a = compute_best_offset(self.field_model.points, self.field_model.plane_b, self.field_model.plane_c)
+        
+        # Calculate best offset based on the terrain
+        base_offset = compute_best_offset(self.field_model.points, self.field_model.plane_b, self.field_model.plane_c)
+        
+        # Add user-specified plane offset to the computed best offset
+        self.field_model.plane_a = base_offset + plane_offset
+        
         self.update_interpolated_grid()
         self.update_cut_fill()
-    
+
     def auto_compute(self):
         self.field_model.update_points_from_grid()
         if not self.field_model.points:
             QMessageBox.warning(self, "Errore", "Nessun dato di rilevamento disponibile.")
             return
+        
+        try:
+            plane_offset = float(self.plane_offset_input.text()) / 100.0  # Convert from cm to meters
+        except ValueError:
+            plane_offset = 0.0
+        
         a, b, c = compute_best_plane(self.field_model.points)
-        self.field_model.plane_a = a
+        
+        # Apply the plane offset to the computed a value
+        self.field_model.plane_a = a + plane_offset
         self.field_model.plane_b = b
         self.field_model.plane_c = c
         
